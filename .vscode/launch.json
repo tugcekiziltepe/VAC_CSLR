@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "VAC-CSLR: extract features",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--load-weights",
+        "C:/Users/Tugce/Documents/github/VAC_CSLR/resnet18_slr_pretrained_distill25.pt",
+        "--phase",
+        "features"
+      ]
+    }
+  ]
+}

@@ -29,11 +29,11 @@ class BaseFeeder(data.Dataset):
         self.mode = mode
         self.ng = num_gloss
         self.prefix = prefix
-        self.dict = gloss_dict
+        self.frame_root = self._resolve_frame_root()
+        self.dict = gloss_dict or dict()
         self.data_type = datatype
-        self.feat_prefix = f"{prefix}/features/fullFrame-256x256px/{mode}"
         self.transform_mode = "train" if transform_mode else "test"
-        self.inputs_list = np.load(f"./preprocess/phoenix2014/{mode}_info.npy", allow_pickle=True).item()
+        self.inputs_list = self._load_inputs_list(mode)
         # self.inputs_list = np.load(f"{prefix}/annotations/manual/{mode}.corpus.npy", allow_pickle=True).item()
         # self.inputs_list = np.load(f"{prefix}/annotations/manual/{mode}.corpus.npy", allow_pickle=True).item()
         # self.inputs_list = dict([*filter(lambda x: isinstance(x[0], str) or x[0] < 10, self.inputs_list.items())])
@@ -58,13 +58,13 @@ class BaseFeeder(data.Dataset):
     def read_video(self, index, num_glosses=-1):
         # load file info
         fi = self.inputs_list[index]
-        img_folder = os.path.join(self.prefix, "features/fullFrame-256x256px/" + fi['folder'])
+        img_folder = os.path.join(self.frame_root, fi['folder'])
         img_list = sorted(glob.glob(img_folder))
         label_list = []
         for phase in fi['label'].split(" "):
             if phase == '':
                 continue
-            if phase in self.dict.keys():
+            if self.dict and phase in self.dict:
                 label_list.append(self.dict[phase][0])
         return [cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB) for img_path in img_list], label_list, fi
 
@@ -140,16 +140,84 @@ class BaseFeeder(data.Dataset):
             padded_video = torch.stack(padded_video).permute(0, 2, 1)
         label_length = torch.LongTensor([len(lab) for lab in label])
         if max(label_length) == 0:
-            return padded_video, video_length, [], [], info
+            padded_label = torch.LongTensor([])
         else:
             padded_label = []
             for lab in label:
                 padded_label.extend(lab)
             padded_label = torch.LongTensor(padded_label)
-            return padded_video, video_length, padded_label, label_length, info
+        return padded_video, video_length, padded_label, label_length, info
 
     def __len__(self):
         return len(self.inputs_list) - 1
+
+    def _resolve_frame_root(self):
+        candidates = [
+            os.path.join(self.prefix, "features/fullFrame-256x256px"),
+            os.path.join(self.prefix, "features/fullFrame-210x260px"),
+        ]
+        for cand in candidates:
+            if os.path.exists(cand):
+                print(f"Using frames from {cand}")
+                return cand
+        raise FileNotFoundError(
+            f"Could not find resized frames under {candidates[0]} or {candidates[1]}. "
+            f"Please verify your dataset path or run the preprocessing step."
+        )
+
+    def _load_inputs_list(self, mode):
+        cache_dir = "./preprocess/phoenix2014"
+        cache_path = os.path.join(cache_dir, f"{mode}_info.npy")
+        if os.path.exists(cache_path):
+            return np.load(cache_path, allow_pickle=True).item()
+        info = self._build_inputs_list_from_annotations(mode)
+        os.makedirs(cache_dir, exist_ok=True)
+        np.save(cache_path, info)
+        return info
+
+    def _annotation_csv_path(self, mode):
+        csv_path = os.path.join(self.prefix, "annotations", "manual", f"{mode}.corpus.csv")
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(
+                f"Annotation file {csv_path} not found. Download the RWTH-PHOENIX annotations or "
+                f"run the preprocessing script to generate metadata."
+            )
+        return csv_path
+
+    def _build_inputs_list_from_annotations(self, mode):
+        csv_path = self._annotation_csv_path(mode)
+        info_dict = {'prefix': self.frame_root.replace("\\", "/")}
+        skip_idx = 2390 if mode == "train" else None
+        with open(csv_path, "r", encoding="utf-8") as f:
+            header = f.readline()
+            sample_idx = 0
+            for line_idx, line in enumerate(f):
+                record = line.strip()
+                if not record:
+                    continue
+                if skip_idx is not None and line_idx == skip_idx:
+                    continue
+                parts = record.split("|")
+                if len(parts) < 4:
+                    continue
+                fileid, folder, signer = parts[:3]
+                label = "|".join(parts[3:]).strip()
+                folder_rel = f"{mode}/{folder}"
+                frame_glob = os.path.join(self.frame_root, folder_rel)
+                num_frames = len(glob.glob(frame_glob))
+                info_dict[sample_idx] = {
+                    'fileid': fileid,
+                    'folder': folder_rel,
+                    'signer': signer,
+                    'label': label,
+                    'num_frames': num_frames,
+                    'original_info': record,
+                }
+                sample_idx += 1
+        if sample_idx == 0:
+            raise ValueError(f"No samples parsed from {csv_path}.")
+        print(f"Built {sample_idx} samples for {mode} directly from annotations.")
+        return info_dict
 
     def record_time(self):
         self.cur_time = time.time()

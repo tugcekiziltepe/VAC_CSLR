@@ -42,7 +42,7 @@ If you find this repo useful in your research works, please consider cite our pa
 
 - This project is implemented in Pytorch (>1.8). Thus please install Pytorch first.
 
-- ctcdecode==0.4 [[parlance/ctcdecode]](https://github.com/parlance/ctcdecode)，for beam search decode.
+- [Optional] ctcdecode==0.4 [[parlance/ctcdecode]](https://github.com/parlance/ctcdecode)，if you prefer to use the original third-party beam search decoder. A lightweight PyTorch beam search implementation is included by default.
 
 - [Optional] sclite [[kaldi-asr/kaldi]](https://github.com/kaldi-asr/kaldi), install kaldi tool to get sclite for evaluation. After installation, create a soft link toward the sclite:    
   `ln -s PATH_TO_KALDI/tools/sctk-2.4.10/bin/sclite ./software/sclite`
@@ -88,6 +88,8 @@ The priorities of configuration files are: command line > config file > default 
 We also provide feature extraction function to extract frame-wise features for other research purpose, which can be achieved by:
 
 `python main.py --load-weights PATH_TO_PRETRAINED_MODEL --phase features ` 
+
+> **Note:** When running in `features` phase a gloss dictionary is optional. If `dict_path` is missing we automatically infer the class count from the loaded checkpoint so you can extract frame-wise features without building `gloss_dict.npy` (the saved `.npy` files will simply contain empty label arrays).
 
 ### To Do List
 

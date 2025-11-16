@@ -1,0 +1,513 @@
+diff --git a/README.md b/README.md
+index 7064131..4605b71 100644
+--- a/README.md
++++ b/README.md
+@@ -42,7 +42,7 @@ If you find this repo useful in your research works, please consider cite our pa
+ 
+ - This project is implemented in Pytorch (>1.8). Thus please install Pytorch first.
+ 
+-- ctcdecode==0.4 [[parlance/ctcdecode]](https://github.com/parlance/ctcdecode)，for beam search decode.
++- [Optional] ctcdecode==0.4 [[parlance/ctcdecode]](https://github.com/parlance/ctcdecode)，if you prefer to use the original third-party beam search decoder. A lightweight PyTorch beam search implementation is included by default.
+ 
+ - [Optional] sclite [[kaldi-asr/kaldi]](https://github.com/kaldi-asr/kaldi), install kaldi tool to get sclite for evaluation. After installation, create a soft link toward the sclite:    
+   `ln -s PATH_TO_KALDI/tools/sctk-2.4.10/bin/sclite ./software/sclite`
+@@ -89,6 +89,8 @@ We also provide feature extraction function to extract frame-wise features for o
+ 
+ `python main.py --load-weights PATH_TO_PRETRAINED_MODEL --phase features ` 
+ 
++> **Note:** When running in `features` phase a gloss dictionary is optional. If `dict_path` is missing we automatically infer the class count from the loaded checkpoint so you can extract frame-wise features without building `gloss_dict.npy` (the saved `.npy` files will simply contain empty label arrays).
++
+ ### To Do List
+ 
+ - [x] Pure python implemented evaluation tools.
+diff --git a/configs/phoenix14.yaml b/configs/phoenix14.yaml
+index 4fecbb8..65522c5 100644
+--- a/configs/phoenix14.yaml
++++ b/configs/phoenix14.yaml
+@@ -1,4 +1,4 @@
+-dataset_root: ./dataset/phoenix2014/phoenix-2014-multisigner
++dataset_root: C:\Users\Tugce\Documents\Datasets\PHOENIX-2014-T
+ dict_path: ./preprocess/phoenix2014/gloss_dict.npy
+ evaluation_dir: ./evaluation/slr_eval
+ evaluation_prefix: phoenix2014-groundtruth
+diff --git a/dataset/dataloader_video.py b/dataset/dataloader_video.py
+index e1be1bd..19e5bc5 100644
+--- a/dataset/dataloader_video.py
++++ b/dataset/dataloader_video.py
+@@ -29,11 +29,11 @@ class BaseFeeder(data.Dataset):
+         self.mode = mode
+         self.ng = num_gloss
+         self.prefix = prefix
+-        self.dict = gloss_dict
++        self.frame_root = self._resolve_frame_root()
++        self.dict = gloss_dict or dict()
+         self.data_type = datatype
+-        self.feat_prefix = f"{prefix}/features/fullFrame-256x256px/{mode}"
+         self.transform_mode = "train" if transform_mode else "test"
+-        self.inputs_list = np.load(f"./preprocess/phoenix2014/{mode}_info.npy", allow_pickle=True).item()
++        self.inputs_list = self._load_inputs_list(mode)
+         # self.inputs_list = np.load(f"{prefix}/annotations/manual/{mode}.corpus.npy", allow_pickle=True).item()
+         # self.inputs_list = np.load(f"{prefix}/annotations/manual/{mode}.corpus.npy", allow_pickle=True).item()
+         # self.inputs_list = dict([*filter(lambda x: isinstance(x[0], str) or x[0] < 10, self.inputs_list.items())])
+@@ -58,13 +58,13 @@ class BaseFeeder(data.Dataset):
+     def read_video(self, index, num_glosses=-1):
+         # load file info
+         fi = self.inputs_list[index]
+-        img_folder = os.path.join(self.prefix, "features/fullFrame-256x256px/" + fi['folder'])
++        img_folder = os.path.join(self.frame_root, fi['folder'])
+         img_list = sorted(glob.glob(img_folder))
+         label_list = []
+         for phase in fi['label'].split(" "):
+             if phase == '':
+                 continue
+-            if phase in self.dict.keys():
++            if self.dict and phase in self.dict:
+                 label_list.append(self.dict[phase][0])
+         return [cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB) for img_path in img_list], label_list, fi
+ 
+@@ -140,17 +140,85 @@ class BaseFeeder(data.Dataset):
+             padded_video = torch.stack(padded_video).permute(0, 2, 1)
+         label_length = torch.LongTensor([len(lab) for lab in label])
+         if max(label_length) == 0:
+-            return padded_video, video_length, [], [], info
++            padded_label = torch.LongTensor([])
+         else:
+             padded_label = []
+             for lab in label:
+                 padded_label.extend(lab)
+             padded_label = torch.LongTensor(padded_label)
+-            return padded_video, video_length, padded_label, label_length, info
++        return padded_video, video_length, padded_label, label_length, info
+ 
+     def __len__(self):
+         return len(self.inputs_list) - 1
+ 
++    def _resolve_frame_root(self):
++        candidates = [
++            os.path.join(self.prefix, "features/fullFrame-256x256px"),
++            os.path.join(self.prefix, "features/fullFrame-210x260px"),
++        ]
++        for cand in candidates:
++            if os.path.exists(cand):
++                print(f"Using frames from {cand}")
++                return cand
++        raise FileNotFoundError(
++            f"Could not find resized frames under {candidates[0]} or {candidates[1]}. "
++            f"Please verify your dataset path or run the preprocessing step."
++        )
++
++    def _load_inputs_list(self, mode):
++        cache_dir = "./preprocess/phoenix2014"
++        cache_path = os.path.join(cache_dir, f"{mode}_info.npy")
++        if os.path.exists(cache_path):
++            return np.load(cache_path, allow_pickle=True).item()
++        info = self._build_inputs_list_from_annotations(mode)
++        os.makedirs(cache_dir, exist_ok=True)
++        np.save(cache_path, info)
++        return info
++
++    def _annotation_csv_path(self, mode):
++        csv_path = os.path.join(self.prefix, "annotations", "manual", f"{mode}.corpus.csv")
++        if not os.path.exists(csv_path):
++            raise FileNotFoundError(
++                f"Annotation file {csv_path} not found. Download the RWTH-PHOENIX annotations or "
++                f"run the preprocessing script to generate metadata."
++            )
++        return csv_path
++
++    def _build_inputs_list_from_annotations(self, mode):
++        csv_path = self._annotation_csv_path(mode)
++        info_dict = {'prefix': self.frame_root.replace("\\", "/")}
++        skip_idx = 2390 if mode == "train" else None
++        with open(csv_path, "r", encoding="utf-8") as f:
++            header = f.readline()
++            sample_idx = 0
++            for line_idx, line in enumerate(f):
++                record = line.strip()
++                if not record:
++                    continue
++                if skip_idx is not None and line_idx == skip_idx:
++                    continue
++                parts = record.split("|")
++                if len(parts) < 4:
++                    continue
++                fileid, folder, signer = parts[:3]
++                label = "|".join(parts[3:]).strip()
++                folder_rel = f"{mode}/{folder}"
++                frame_glob = os.path.join(self.frame_root, folder_rel)
++                num_frames = len(glob.glob(frame_glob))
++                info_dict[sample_idx] = {
++                    'fileid': fileid,
++                    'folder': folder_rel,
++                    'signer': signer,
++                    'label': label,
++                    'num_frames': num_frames,
++                    'original_info': record,
++                }
++                sample_idx += 1
++        if sample_idx == 0:
++            raise ValueError(f"No samples parsed from {csv_path}.")
++        print(f"Built {sample_idx} samples for {mode} directly from annotations.")
++        return info_dict
++
+     def record_time(self):
+         self.cur_time = time.time()
+         return self.cur_time
+diff --git a/main.py b/main.py
+index eadaf28..820b002 100644
+--- a/main.py
++++ b/main.py
+@@ -27,11 +27,11 @@ class Processor():
+             self.rng = utils.RandomState(seed=self.arg.random_seed)
+         self.device = utils.GpuDataParallel()
+         self.recoder = utils.Recorder(self.arg.work_dir, self.arg.print_log, self.arg.log_interval)
+-        self.dataset = {}
+-        self.data_loader = {}
+-        self.gloss_dict = np.load(self.arg.dataset_info['dict_path'], allow_pickle=True).item()
+-        self.arg.model_args['num_classes'] = len(self.gloss_dict) + 1
+-        self.model, self.optimizer = self.loading()
++        self.dataset = {}
++        self.data_loader = {}
++        self.gloss_dict = self.load_gloss_dict()
++        self.arg.model_args['num_classes'] = self.determine_num_classes()
++        self.model, self.optimizer = self.loading()
+ 
+     def start(self):
+         if self.arg.phase == 'train':
+@@ -78,14 +78,47 @@ class Processor():
+         with open('{}/config.yaml'.format(self.arg.work_dir), 'w') as f:
+             yaml.dump(arg_dict, f)
+ 
+-    def save_model(self, epoch, save_path):
+-        torch.save({
+-            'epoch': epoch,
+-            'model_state_dict': self.model.state_dict(),
+-            'optimizer_state_dict': self.optimizer.state_dict(),
+-            'scheduler_state_dict': self.optimizer.scheduler.state_dict(),
+-            'rng_state': self.rng.save_rng_state(),
+-        }, save_path)
++    def save_model(self, epoch, save_path):
++        torch.save({
++            'epoch': epoch,
++            'model_state_dict': self.model.state_dict(),
++            'optimizer_state_dict': self.optimizer.state_dict(),
++            'scheduler_state_dict': self.optimizer.scheduler.state_dict(),
++            'rng_state': self.rng.save_rng_state(),
++        }, save_path)
++
++    def load_gloss_dict(self):
++        dict_path = self.arg.dataset_info.get('dict_path')
++        if dict_path and os.path.exists(dict_path):
++            return np.load(dict_path, allow_pickle=True).item()
++        if self.arg.phase != "features":
++            raise FileNotFoundError(f"Gloss dictionary not found at {dict_path}. "
++                                    f"Create it via preprocess step or provide a valid path.")
++        if self.arg.print_log:
++            print("Gloss dictionary not found. Continuing without it because phase=features.")
++        return None
++
++    def determine_num_classes(self):
++        if self.gloss_dict:
++            return len(self.gloss_dict) + 1
++        checkpoint_path = self.arg.load_weights or self.arg.load_checkpoints
++        if not checkpoint_path:
++            raise ValueError("Gloss dictionary missing and no pretrained weights provided to "
++                             "infer class count. Provide --load-weights or the gloss dictionary.")
++        map_location = None
++        device_arg = 'None' if self.arg.device is None else str(self.arg.device)
++        if device_arg.lower() in ('none', 'cpu') or not torch.cuda.is_available():
++            map_location = 'cpu'
++        state_dict = torch.load(checkpoint_path, map_location=map_location)
++        if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
++            state_dict = state_dict['model_state_dict']
++        if not isinstance(state_dict, dict):
++            raise ValueError("Unable to infer number of classes from checkpoint.")
++        for key in ['classifier.weight', 'conv1d.fc.weight']:
++            if key in state_dict:
++                weight = state_dict[key]
++                return weight.shape[0]
++        raise ValueError("Unable to locate classifier weights to infer number of classes.")
+ 
+     def loading(self):
+         self.device.set_device(self.arg.device)
+@@ -107,16 +140,17 @@ class Processor():
+         self.load_data()
+         return model, optimizer
+ 
+-    def model_to_device(self, model):
+-        model = model.to(self.device.output_device)
+-        if len(self.device.gpu_list) > 1:
+-            model.conv2d = nn.DataParallel(
+-                model.conv2d,
+-                device_ids=self.device.gpu_list,
+-                output_device=self.device.output_device)
+-        model = convert_model(model)
+-        model.cuda()
+-        return model
++    def model_to_device(self, model):
++        model = model.to(self.device.output_device)
++        if len(self.device.gpu_list) > 1:
++            model.conv2d = nn.DataParallel(
++                model.conv2d,
++                device_ids=self.device.gpu_list,
++                output_device=self.device.output_device)
++        model = convert_model(model)
++        if len(self.device.gpu_list) > 0:
++            model.cuda()
++        return model
+ 
+     def load_model_weights(self, model, weight_path):
+         state_dict = torch.load(weight_path)
+diff --git a/slr_network.py b/slr_network.py
+index 116c913..c4bc06a 100644
+--- a/slr_network.py
++++ b/slr_network.py
+@@ -49,7 +49,7 @@ class SLRModel(nn.Module):
+                                    conv_type=conv_type,
+                                    use_bn=use_bn,
+                                    num_classes=num_classes)
+-        self.decoder = utils.Decode(gloss_dict, num_classes, 'beam')
++        self.decoder = utils.Decode(gloss_dict, num_classes, 'beam') if gloss_dict else None
+         self.temporal_model = BiLSTMLayer(rnn_type='LSTM', input_size=hidden_size, hidden_size=hidden_size,
+                                           num_layers=2, bidirectional=True)
+         if weight_norm:
+@@ -93,10 +93,12 @@ class SLRModel(nn.Module):
+         lgt = conv1d_outputs['feat_len']
+         tm_outputs = self.temporal_model(x, lgt)
+         outputs = self.classifier(tm_outputs['predictions'])
+-        pred = None if self.training \
+-            else self.decoder.decode(outputs, lgt, batch_first=False, probs=False)
+-        conv_pred = None if self.training \
+-            else self.decoder.decode(conv1d_outputs['conv_logits'], lgt, batch_first=False, probs=False)
++        if not self.training and self.decoder is not None:
++            pred = self.decoder.decode(outputs, lgt, batch_first=False, probs=False)
++            conv_pred = self.decoder.decode(conv1d_outputs['conv_logits'], lgt, batch_first=False, probs=False)
++        else:
++            pred = None
++            conv_pred = None
+ 
+         return {
+             "framewise_features": framewise,
+diff --git a/utils/decode.py b/utils/decode.py
+index f0c27d9..5de5d05 100644
+--- a/utils/decode.py
++++ b/utils/decode.py
+@@ -2,12 +2,118 @@ import os
+ import pdb
+ import time
+ import torch
+-import ctcdecode
+ import numpy as np
+ from itertools import groupby
+ import torch.nn.functional as F
+ 
+ 
++class SimpleCTCBeamDecoder:
++    """
++    Lightweight pure PyTorch beam-search decoder so that we do not depend on
++    the external ctcdecode package. It implements a Viterbi-style search that
++    keeps the top-N prefixes at every timestep and merges identical prefixes
++    by keeping the best score. The interface is aligned with ctcdecode so the
++    rest of the pipeline can stay unchanged.
++    """
++
++    def __init__(self, blank_id=0, beam_width=10):
++        self.blank_id = blank_id
++        self.beam_width = beam_width
++
++    def _update(self, beam_dict, prefix, score):
++        if prefix in beam_dict:
++            if score > beam_dict[prefix]:
++                beam_dict[prefix] = score
++        else:
++            beam_dict[prefix] = score
++
++    def _beam_search_single(self, log_probs):
++        """
++        Args:
++            log_probs (Tensor): (T, C) log probabilities for a single sample.
++        Returns:
++            List[Tuple[Tuple[int, ...], float]]: best prefixes and scores.
++        """
++        Timesteps, _ = log_probs.shape
++        beam = {tuple(): 0.0}
++
++        for t in range(Timesteps):
++            next_beam = {}
++            log_probs_t = log_probs[t]
++            blank_score = float(log_probs_t[self.blank_id])
++            for prefix, score in beam.items():
++                # Stay on the current prefix via blank
++                self._update(next_beam, prefix, score + blank_score)
++
++                topk = min(self.beam_width, log_probs_t.numel())
++                values, indices = torch.topk(log_probs_t, k=topk)
++                for value, idx in zip(values.tolist(), indices.tolist()):
++                    if idx == self.blank_id:
++                        continue
++                    new_prefix = prefix + (int(idx),)
++                    self._update(next_beam, new_prefix, score + float(value))
++
++            if not next_beam:
++                next_beam = beam
++
++            sorted_beam = sorted(next_beam.items(), key=lambda x: x[1], reverse=True)
++            beam = dict(sorted_beam[:self.beam_width])
++
++        # Ensure we always return beam_width beams, padded with blanks if needed
++        beam_items = sorted(beam.items(), key=lambda x: x[1], reverse=True)
++        if not beam_items:
++            beam_items = [(tuple(), float("-inf"))]
++        while len(beam_items) < self.beam_width:
++            beam_items.append((tuple(), float("-inf")))
++        return beam_items[:self.beam_width]
++
++    def decode(self, probs, seq_lgt):
++        batch, max_timesteps, num_classes = probs.shape
++        seq_lgt = seq_lgt.cpu().tolist()
++        probs = probs.cpu()
++
++        all_sequences = []
++        all_scores = []
++        max_output_length = 0
++
++        for batch_idx in range(batch):
++            tgt_len = seq_lgt[batch_idx]
++            sample_probs = probs[batch_idx, :tgt_len]
++            if sample_probs.numel() == 0:
++                beam_items = [(tuple(), float("-inf")) for _ in range(self.beam_width)]
++            else:
++                log_probs = torch.log(torch.clamp(sample_probs, min=1e-12))
++                beam_items = self._beam_search_single(log_probs)
++
++            sequences = [list(prefix) for prefix, _ in beam_items]
++            scores = [score for _, score in beam_items]
++            max_output_length = max(max_output_length, max((len(seq) for seq in sequences), default=0))
++
++            all_sequences.append(sequences)
++            all_scores.append(scores)
++
++        if max_output_length == 0:
++            max_output_length = 1
++
++        beam_result = torch.full((batch, self.beam_width, max_output_length),
++                                 fill_value=self.blank_id, dtype=torch.int32)
++        beam_scores = torch.full((batch, self.beam_width), fill_value=float("inf"))
++        out_seq_len = torch.zeros((batch, self.beam_width), dtype=torch.int32)
++        timesteps = torch.zeros((batch, self.beam_width, max_output_length), dtype=torch.int32)
++
++        for batch_idx, (sequences, scores) in enumerate(zip(all_sequences, all_scores)):
++            for beam_idx, (seq, score) in enumerate(zip(sequences, scores)):
++                length = len(seq)
++                if length > 0:
++                    beam_result[batch_idx, beam_idx, :length] = torch.tensor(seq, dtype=torch.int32)
++                out_seq_len[batch_idx, beam_idx] = length
++                beam_scores[batch_idx, beam_idx] = -score  # positive scores like ctcdecode
++                if length > 0:
++                    timesteps[batch_idx, beam_idx, :length] = torch.arange(length, dtype=torch.int32)
++
++        return beam_result, beam_scores, timesteps, out_seq_len
++
++
+ class Decode(object):
+     def __init__(self, gloss_dict, num_classes, search_mode, blank_id=0):
+         self.i2g_dict = dict((v[0], k) for k, v in gloss_dict.items())
+@@ -15,9 +121,7 @@ class Decode(object):
+         self.num_classes = num_classes
+         self.search_mode = search_mode
+         self.blank_id = blank_id
+-        vocab = [chr(x) for x in range(20000, 20000 + num_classes)]
+-        self.ctc_decoder = ctcdecode.CTCBeamDecoder(vocab, beam_width=10, blank_id=blank_id,
+-                                                    num_processes=10)
++        self.ctc_decoder = SimpleCTCBeamDecoder(blank_id=blank_id, beam_width=10)
+ 
+     def decode(self, nn_output, vid_lgt, batch_first=True, probs=False):
+         if not batch_first:
+diff --git a/utils/device.py b/utils/device.py
+index 14d7cca..7b7311e 100644
+--- a/utils/device.py
++++ b/utils/device.py
+@@ -7,16 +7,66 @@ import torch.nn as nn
+ class GpuDataParallel(object):
+     def __init__(self):
+         self.gpu_list = []
+-        self.output_device = None
++        self.output_device = "cpu"
+ 
+     def set_device(self, device):
+-        device = str(device)
+-        if device != 'None':
+-            self.gpu_list = [i for i in range(len(device.split(',')))]
+-            os.environ["CUDA_VISIBLE_DEVICES"] = device
+-            output_device = self.gpu_list[0]
++        device = 'None' if device is None else str(device)
++        self.gpu_list = []
++        self.output_device = "cpu"
++
++        if device.lower() in ('none', 'cpu'):
++            return
++
++        requested = [d.strip() for d in device.split(',') if d.strip() != '']
++        if not requested:
++            return
++
++        try:
++            cuda_available = torch.cuda.is_available()
++        except RuntimeError as err:
++            print(f"CUDA initialization failed ({err}). Falling back to CPU.")
++            return
++        if not cuda_available:
++            print("CUDA is not available. Falling back to CPU.")
++            return
++
++        available_gpu = torch.cuda.device_count()
++        valid_gpu = []
++        for d in requested:
++            try:
++                idx = int(d)
++            except ValueError:
++                print(f"Invalid GPU id '{d}', ignoring.")
++                continue
++            if idx >= available_gpu:
++                print(f"Requested GPU {idx} but only {available_gpu} device(s) are available. Ignoring.")
++                continue
++            valid_gpu.append(d)
++        if not valid_gpu:
++            print("No valid GPU ids found. Falling back to CPU.")
++            return
++
++        prev_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
++        new_visible = ",".join(valid_gpu)
++        os.environ["CUDA_VISIBLE_DEVICES"] = new_visible
++
++        def restore_visible():
++            if prev_visible is None:
++                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
++            else:
++                os.environ["CUDA_VISIBLE_DEVICES"] = prev_visible
++
++        self.gpu_list = [i for i in range(len(valid_gpu))]
++        output_device = self.gpu_list[0]
++        try:
+             self.occupy_gpu(self.gpu_list)
+-        self.output_device = output_device if len(self.gpu_list) > 0 else "cpu"
++        except RuntimeError as err:
++            print(f"Unable to initialize requested GPU(s): {err}. Falling back to CPU.")
++            self.gpu_list = []
++            self.output_device = "cpu"
++            restore_visible()
++            return
++        self.output_device = output_device
+ 
+     def model_to_device(self, model):
+         # model = convert_model(model)
+@@ -49,6 +99,9 @@ class GpuDataParallel(object):
+         """
+             make program appear on nvidia-smi.
+         """
++        if not torch.cuda.is_available():
++            return
++        gpus = [] if gpus is None else gpus
+         if len(gpus) == 0:
+             torch.zeros(1).cuda()
+         else:

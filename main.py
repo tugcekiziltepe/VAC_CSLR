@@ -29,8 +29,8 @@ class Processor():
         self.recoder = utils.Recorder(self.arg.work_dir, self.arg.print_log, self.arg.log_interval)
         self.dataset = {}
         self.data_loader = {}
-        self.gloss_dict = np.load(self.arg.dataset_info['dict_path'], allow_pickle=True).item()
-        self.arg.model_args['num_classes'] = len(self.gloss_dict) + 1
+        self.gloss_dict = self.load_gloss_dict()
+        self.arg.model_args['num_classes'] = self.determine_num_classes()
         self.model, self.optimizer = self.loading()
 
     def start(self):
@@ -87,6 +87,39 @@ class Processor():
             'rng_state': self.rng.save_rng_state(),
         }, save_path)
 
+    def load_gloss_dict(self):
+        dict_path = self.arg.dataset_info.get('dict_path')
+        if dict_path and os.path.exists(dict_path):
+            return np.load(dict_path, allow_pickle=True).item()
+        if self.arg.phase != "features":
+            raise FileNotFoundError(f"Gloss dictionary not found at {dict_path}. "
+                                    f"Create it via preprocess step or provide a valid path.")
+        if self.arg.print_log:
+            print("Gloss dictionary not found. Continuing without it because phase=features.")
+        return None
+
+    def determine_num_classes(self):
+        if self.gloss_dict:
+            return len(self.gloss_dict) + 1
+        checkpoint_path = self.arg.load_weights or self.arg.load_checkpoints
+        if not checkpoint_path:
+            raise ValueError("Gloss dictionary missing and no pretrained weights provided to "
+                             "infer class count. Provide --load-weights or the gloss dictionary.")
+        map_location = None
+        device_arg = 'None' if self.arg.device is None else str(self.arg.device)
+        if device_arg.lower() in ('none', 'cpu') or not torch.cuda.is_available():
+            map_location = 'cpu'
+        state_dict = torch.load(checkpoint_path, map_location=map_location)
+        if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+            state_dict = state_dict['model_state_dict']
+        if not isinstance(state_dict, dict):
+            raise ValueError("Unable to infer number of classes from checkpoint.")
+        for key in ['classifier.weight', 'conv1d.fc.weight']:
+            if key in state_dict:
+                weight = state_dict[key]
+                return weight.shape[0]
+        raise ValueError("Unable to locate classifier weights to infer number of classes.")
+
     def loading(self):
         self.device.set_device(self.arg.device)
         print("Loading model")
@@ -115,7 +148,8 @@ class Processor():
                 device_ids=self.device.gpu_list,
                 output_device=self.device.output_device)
         model = convert_model(model)
-        model.cuda()
+        if len(self.device.gpu_list) > 0:
+            model.cuda()
         return model
 
     def load_model_weights(self, model, weight_path):

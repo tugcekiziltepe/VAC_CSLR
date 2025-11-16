@@ -2,10 +2,116 @@ import os
 import pdb
 import time
 import torch
-import ctcdecode
 import numpy as np
 from itertools import groupby
 import torch.nn.functional as F
+
+
+class SimpleCTCBeamDecoder:
+    """
+    Lightweight pure PyTorch beam-search decoder so that we do not depend on
+    the external ctcdecode package. It implements a Viterbi-style search that
+    keeps the top-N prefixes at every timestep and merges identical prefixes
+    by keeping the best score. The interface is aligned with ctcdecode so the
+    rest of the pipeline can stay unchanged.
+    """
+
+    def __init__(self, blank_id=0, beam_width=10):
+        self.blank_id = blank_id
+        self.beam_width = beam_width
+
+    def _update(self, beam_dict, prefix, score):
+        if prefix in beam_dict:
+            if score > beam_dict[prefix]:
+                beam_dict[prefix] = score
+        else:
+            beam_dict[prefix] = score
+
+    def _beam_search_single(self, log_probs):
+        """
+        Args:
+            log_probs (Tensor): (T, C) log probabilities for a single sample.
+        Returns:
+            List[Tuple[Tuple[int, ...], float]]: best prefixes and scores.
+        """
+        Timesteps, _ = log_probs.shape
+        beam = {tuple(): 0.0}
+
+        for t in range(Timesteps):
+            next_beam = {}
+            log_probs_t = log_probs[t]
+            blank_score = float(log_probs_t[self.blank_id])
+            for prefix, score in beam.items():
+                # Stay on the current prefix via blank
+                self._update(next_beam, prefix, score + blank_score)
+
+                topk = min(self.beam_width, log_probs_t.numel())
+                values, indices = torch.topk(log_probs_t, k=topk)
+                for value, idx in zip(values.tolist(), indices.tolist()):
+                    if idx == self.blank_id:
+                        continue
+                    new_prefix = prefix + (int(idx),)
+                    self._update(next_beam, new_prefix, score + float(value))
+
+            if not next_beam:
+                next_beam = beam
+
+            sorted_beam = sorted(next_beam.items(), key=lambda x: x[1], reverse=True)
+            beam = dict(sorted_beam[:self.beam_width])
+
+        # Ensure we always return beam_width beams, padded with blanks if needed
+        beam_items = sorted(beam.items(), key=lambda x: x[1], reverse=True)
+        if not beam_items:
+            beam_items = [(tuple(), float("-inf"))]
+        while len(beam_items) < self.beam_width:
+            beam_items.append((tuple(), float("-inf")))
+        return beam_items[:self.beam_width]
+
+    def decode(self, probs, seq_lgt):
+        batch, max_timesteps, num_classes = probs.shape
+        seq_lgt = seq_lgt.cpu().tolist()
+        probs = probs.cpu()
+
+        all_sequences = []
+        all_scores = []
+        max_output_length = 0
+
+        for batch_idx in range(batch):
+            tgt_len = seq_lgt[batch_idx]
+            sample_probs = probs[batch_idx, :tgt_len]
+            if sample_probs.numel() == 0:
+                beam_items = [(tuple(), float("-inf")) for _ in range(self.beam_width)]
+            else:
+                log_probs = torch.log(torch.clamp(sample_probs, min=1e-12))
+                beam_items = self._beam_search_single(log_probs)
+
+            sequences = [list(prefix) for prefix, _ in beam_items]
+            scores = [score for _, score in beam_items]
+            max_output_length = max(max_output_length, max((len(seq) for seq in sequences), default=0))
+
+            all_sequences.append(sequences)
+            all_scores.append(scores)
+
+        if max_output_length == 0:
+            max_output_length = 1
+
+        beam_result = torch.full((batch, self.beam_width, max_output_length),
+                                 fill_value=self.blank_id, dtype=torch.int32)
+        beam_scores = torch.full((batch, self.beam_width), fill_value=float("inf"))
+        out_seq_len = torch.zeros((batch, self.beam_width), dtype=torch.int32)
+        timesteps = torch.zeros((batch, self.beam_width, max_output_length), dtype=torch.int32)
+
+        for batch_idx, (sequences, scores) in enumerate(zip(all_sequences, all_scores)):
+            for beam_idx, (seq, score) in enumerate(zip(sequences, scores)):
+                length = len(seq)
+                if length > 0:
+                    beam_result[batch_idx, beam_idx, :length] = torch.tensor(seq, dtype=torch.int32)
+                out_seq_len[batch_idx, beam_idx] = length
+                beam_scores[batch_idx, beam_idx] = -score  # positive scores like ctcdecode
+                if length > 0:
+                    timesteps[batch_idx, beam_idx, :length] = torch.arange(length, dtype=torch.int32)
+
+        return beam_result, beam_scores, timesteps, out_seq_len
 
 
 class Decode(object):
@@ -15,9 +121,7 @@ class Decode(object):
         self.num_classes = num_classes
         self.search_mode = search_mode
         self.blank_id = blank_id
-        vocab = [chr(x) for x in range(20000, 20000 + num_classes)]
-        self.ctc_decoder = ctcdecode.CTCBeamDecoder(vocab, beam_width=10, blank_id=blank_id,
-                                                    num_processes=10)
+        self.ctc_decoder = SimpleCTCBeamDecoder(blank_id=blank_id, beam_width=10)
 
     def decode(self, nn_output, vid_lgt, batch_first=True, probs=False):
         if not batch_first:

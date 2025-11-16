@@ -49,7 +49,7 @@ class SLRModel(nn.Module):
                                    conv_type=conv_type,
                                    use_bn=use_bn,
                                    num_classes=num_classes)
-        self.decoder = utils.Decode(gloss_dict, num_classes, 'beam')
+        self.decoder = utils.Decode(gloss_dict, num_classes, 'beam') if gloss_dict else None
         self.temporal_model = BiLSTMLayer(rnn_type='LSTM', input_size=hidden_size, hidden_size=hidden_size,
                                           num_layers=2, bidirectional=True)
         if weight_norm:
@@ -93,10 +93,12 @@ class SLRModel(nn.Module):
         lgt = conv1d_outputs['feat_len']
         tm_outputs = self.temporal_model(x, lgt)
         outputs = self.classifier(tm_outputs['predictions'])
-        pred = None if self.training \
-            else self.decoder.decode(outputs, lgt, batch_first=False, probs=False)
-        conv_pred = None if self.training \
-            else self.decoder.decode(conv1d_outputs['conv_logits'], lgt, batch_first=False, probs=False)
+        if not self.training and self.decoder is not None:
+            pred = self.decoder.decode(outputs, lgt, batch_first=False, probs=False)
+            conv_pred = self.decoder.decode(conv1d_outputs['conv_logits'], lgt, batch_first=False, probs=False)
+        else:
+            pred = None
+            conv_pred = None
 
         return {
             "framewise_features": framewise,
